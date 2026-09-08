@@ -44,6 +44,15 @@ ensure_distro_pkg() {
 	echo "$tag"
 }
 
+# ensure_pulled TAG -- pulls if not already present locally
+ensure_pulled() {
+	local tag="$1"
+	if ! image_exists "$tag"; then
+		echo "+ docker pull $tag" >&2
+		docker pull "$tag" >&2
+	fi
+}
+
 # ensure_overlay BASE_IMAGE NEED_CURL NEED_IMAGICK -> builds/reuses the
 # hyperfine(+curl/imagick) overlay on top of BASE_IMAGE, echoes the
 # resulting tag. NEED_CURL/NEED_IMAGICK must be 0 for any base image that
@@ -54,10 +63,7 @@ ensure_overlay() {
 	local safe_base; safe_base="$(echo "$base_image" | tr '/:' '__')"
 	local tag="php-bench/overlay:${safe_base}-c${need_curl}-i${need_imagick}"
 	if ! image_exists "$tag"; then
-		if ! image_exists "$base_image"; then
-			echo "+ docker pull $base_image" >&2
-			docker pull "$base_image" >&2
-		fi
+		ensure_pulled "$base_image"
 		docker_build "$tag" "${PROJECT_DIR}/images/overlay/Dockerfile" "${PROJECT_DIR}/images/overlay" \
 			"BASE_IMAGE=${base_image}" "NEED_CURL=${need_curl}" "NEED_IMAGICK=${need_imagick}" >&2
 	fi
@@ -69,12 +75,13 @@ usage() {
 Usage: run.sh <command> [args]
 
 Commands:
-  list                              Show the full target matrix
-  build-distro-pkg [os...]          Build distro-pkg images (default: all)
-  bench cpu     [--only PATTERN]    Run the CPU microbenchmark suite
-  bench tls     [--only PATTERN]    Run the TLS/CA-verification suite
-  bench imagick [--only PATTERN]    Run the Imagick resize suite
-  report <suite>                    Print results/<suite>/*.json as CSV
+  list                                Show the full target matrix
+  build-distro-pkg [os...]            Build distro-pkg images (default: all)
+  bench cpu        [--only PATTERN]   Run the CPU microbenchmark suite
+  bench tls        [--only PATTERN]   Run the TLS/CA-verification suite
+  bench imagick    [--only PATTERN]   Run the Imagick resize suite
+  bench throughput [--only PATTERN]   Run the apache/fpm throughput suite
+  report <suite>                      Print results/<suite>/*.json as CSV
 EOF
 }
 
@@ -103,6 +110,9 @@ cmd_list() {
 	echo
 	echo "-- distro-pkg targets --"
 	list_distro_pkg_targets | awk -F'|' '{printf "%-40s %s (from %s)\n", $1, $5, $2}'
+	echo
+	echo "-- throughput targets --"
+	list_throughput_targets | awk -F'|' '{printf "%-40s %s\n", $1, $5}'
 }
 
 cmd_build_distro_pkg() {
@@ -145,6 +155,81 @@ bench_script_suite() {
 	done
 }
 
+THROUGHPUT_NETWORK="php-bench-throughput"
+THROUGHPUT_SERVER="php-bench-throughput-server"
+THROUGHPUT_FPM="php-bench-throughput-fpm"
+
+# bench_throughput_target ID VERSION OS MODE -- starts the server (apache
+# mpm_prefork, or fpm+nginx) on a private docker network, waits for it to
+# accept connections, points bench/throughput/scripts/load.php at it, and
+# tears the containers down again. See bench/throughput/app/index.php and
+# https://github.com/docker-library/php/issues/681 for what this compares
+# (and targets.sh for why mpm_event isn't one of the modes).
+bench_throughput_target() {
+	local id="$1" version="$2" os="$3" mode="$4"
+	echo "=== throughput: ${id} ===" >&2
+
+	docker rm -f "$THROUGHPUT_SERVER" "$THROUGHPUT_FPM" >/dev/null 2>&1 || true
+
+	local app_dir="${PROJECT_DIR}/bench/throughput/app"
+	case "$mode" in
+		apache-prefork)
+			local image; image="$(official_image "$version" apache "$os")"
+			ensure_pulled "$image"
+			docker run -d --rm --name "$THROUGHPUT_SERVER" --network "$THROUGHPUT_NETWORK" \
+				-v "${app_dir}:/var/www/html:ro" \
+				"$image" >/dev/null
+			;;
+		fpm-nginx)
+			local fpm_image; fpm_image="$(official_image "$version" fpm "$os")"
+			ensure_pulled "$fpm_image"
+			ensure_pulled nginx:stable
+			docker run -d --rm --name "$THROUGHPUT_FPM" --network "$THROUGHPUT_NETWORK" --network-alias fpm-backend \
+				-v "${app_dir}:/var/www/html:ro" \
+				"$fpm_image" >/dev/null
+			docker run -d --rm --name "$THROUGHPUT_SERVER" --network "$THROUGHPUT_NETWORK" \
+				-v "${app_dir}:/var/www/html:ro" \
+				-v "${PROJECT_DIR}/bench/throughput/nginx/nginx.conf:/etc/nginx/nginx.conf:ro" \
+				nginx:stable >/dev/null
+			;;
+		*)
+			echo "unknown throughput mode: $mode" >&2
+			return 2
+			;;
+	esac
+
+	# Reuses the tls suite's port-wait script rather than adding another one.
+	docker run --rm --network "$THROUGHPUT_NETWORK" \
+		-v "${PROJECT_DIR}/bench/tls/scripts:/scripts:ro" \
+		php:cli-alpine php /scripts/wait-for-port.php "$THROUGHPUT_SERVER" 80
+
+	local out_dir="${RESULTS_DIR}/throughput"
+	mkdir -p "$out_dir"
+	docker run --rm --network "$THROUGHPUT_NETWORK" \
+		-v "${PROJECT_DIR}/bench/throughput/scripts:/scripts:ro" \
+		php:cli \
+		php /scripts/load.php "http://${THROUGHPUT_SERVER}/" "${LOAD_CONCURRENCY:-20}" "${LOAD_DURATION:-8}" \
+		> "${out_dir}/throughput-${id}.json"
+
+	docker rm -f "$THROUGHPUT_SERVER" "$THROUGHPUT_FPM" >/dev/null 2>&1 || true
+}
+
+bench_throughput_suite() {
+	local only=""
+	if [ "${1:-}" = "--only" ]; then
+		only="$2"
+	fi
+
+	docker network inspect "$THROUGHPUT_NETWORK" >/dev/null 2>&1 || docker network create "$THROUGHPUT_NETWORK" >/dev/null
+	trap 'docker rm -f "$THROUGHPUT_SERVER" "$THROUGHPUT_FPM" >/dev/null 2>&1 || true' EXIT
+
+	local id version os mode label
+	list_throughput_targets | while IFS='|' read -r id version os mode label; do
+		[ -n "$only" ] && [[ "$id" != *"$only"* ]] && continue
+		bench_throughput_target "$id" "$version" "$os" "$mode"
+	done
+}
+
 cmd_bench() {
 	local suite="$1"
 	shift
@@ -157,17 +242,22 @@ cmd_bench() {
 			fi
 			bench_script_suite imagick 0 1 "$@"
 			;;
+		throughput) bench_throughput_suite "$@" ;;
 		*)
-			echo "unknown suite: $suite (expected cpu|tls|imagick)" >&2
+			echo "unknown suite: $suite (expected cpu|tls|imagick|throughput)" >&2
 			exit 2
 			;;
 	esac
 }
 
-# Flattens hyperfine's --export-json output across all targets in a suite
-# into one CSV on stdout (target_id,command,mean_ms,stddev_ms,min_ms,max_ms).
-# Deliberately just CSV, not a bespoke table format -- pipe it into a
-# spreadsheet, `column -s, -t`, or further jq/awk as needed.
+# Flattens a suite's per-target JSON into one CSV on stdout. Deliberately
+# just CSV, not a bespoke table format -- pipe it into a spreadsheet,
+# `column -s, -t`, or further jq/awk as needed.
+#
+# cpu/tls/imagick use hyperfine's --export-json schema (one file can hold
+# several named commands); throughput's files are a single JSON object
+# (bench/throughput/scripts/load.php's output), so it gets its own header
+# and jq filter.
 cmd_report() {
 	local suite="$1"
 	local dir="${RESULTS_DIR}/${suite}"
@@ -176,16 +266,28 @@ cmd_report() {
 		return 1
 	fi
 
-	echo "target_id,command,mean_ms,stddev_ms,min_ms,max_ms"
 	local file base target_id
-	for file in "$dir"/"${suite}"-*.json; do
-		[ -e "$file" ] || continue
-		base="$(basename "$file" .json)"
-		target_id="${base#"${suite}"-}"
-		jq -r --arg tid "$target_id" '
-			.results[] | [$tid, .command, (.mean*1000), (.stddev*1000), (.min*1000), (.max*1000)] | @csv
-		' "$file"
-	done
+	if [ "$suite" = throughput ]; then
+		echo "target_id,requests,errors,duration_s,rps,p50_ms,p95_ms,p99_ms"
+		for file in "$dir"/"${suite}"-*.json; do
+			[ -e "$file" ] || continue
+			base="$(basename "$file" .json)"
+			target_id="${base#"${suite}"-}"
+			jq -r --arg tid "$target_id" '
+				[$tid, .requests, .errors, .duration_s, .rps, .p50_ms, .p95_ms, .p99_ms] | @csv
+			' "$file"
+		done
+	else
+		echo "target_id,command,mean_ms,stddev_ms,min_ms,max_ms"
+		for file in "$dir"/"${suite}"-*.json; do
+			[ -e "$file" ] || continue
+			base="$(basename "$file" .json)"
+			target_id="${base#"${suite}"-}"
+			jq -r --arg tid "$target_id" '
+				.results[] | [$tid, .command, (.mean*1000), (.stddev*1000), (.min*1000), (.max*1000)] | @csv
+			' "$file"
+		done
+	fi
 }
 
 main() {

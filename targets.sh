@@ -87,13 +87,24 @@ list_distro_pkg_targets() {
 	done
 }
 
-# Emits "id|version|os|mode|label" for the apache/fpm architecture comparison.
+# Emits "id|version|os|mode|label" for the apache/fpm architecture
+# comparison. Only prefork and fpm-nginx are here, not the mpm_event swap
+# https://github.com/docker-library/php/issues/742 discusses: the official
+# apache image is an NTS build, and Apache refuses to load a non-thread-safe
+# PHP module under a threaded MPM (mpm_event/mpm_worker) -- confirmed by
+# actually trying it (`a2enmod mpm_event` -> "Apache is running a threaded
+# MPM, but your PHP Module is not compiled to be threadsafe"), and there is
+# no official image today that combines ZTS with Apache to work around it.
+# That's a real, reproducible answer to #742, just not one hyperfine/a load
+# test can put a number on.
 list_throughput_targets() {
 	local version os mode
 	for version in "${PHP_VERSIONS[@]}"; do
 		for os in "${DEBIAN_OSES[@]}"; do  # apache variant is Debian-only
-			for mode in apache-prefork apache-event fpm-nginx; do
-				echo "throughput-${version}-${os}-${mode}|${version}|${os}|${mode}|php:${version}-*-${os} [${mode}]"
+			for mode in apache-prefork fpm-nginx; do
+				local sapi=apache
+				[[ "$mode" == fpm-nginx ]] && sapi=fpm
+				echo "throughput-${version}-${os}-${mode}|${version}|${os}|${mode}|php:${version}-${sapi}-${os} [${mode}]"
 			done
 		done
 	done
