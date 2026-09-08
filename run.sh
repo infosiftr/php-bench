@@ -125,20 +125,20 @@ cmd_build_distro_pkg() {
 	done
 }
 
-# bench_script_suite SUITE NEED_CURL NEED_IMAGICK [--only PATTERN]
+# bench_script_suite SUITE NEED_CURL NEED_IMAGICK TARGET_FN [--only PATTERN]
 # Shared driver for cpu/tls/imagick: all three run one script (or a fixed
-# script list) via bench/<suite>/run.sh against every CLI-official target
-# plus every distro-pkg target.
+# script list) via bench/<suite>/run.sh against every target TARGET_FN
+# lists (a targets.sh list_*_targets function) plus every distro-pkg target.
 bench_script_suite() {
-	local suite="$1" need_curl="$2" need_imagick="$3"
-	shift 3
+	local suite="$1" need_curl="$2" need_imagick="$3" target_fn="$4"
+	shift 4
 	local only=""
 	if [ "${1:-}" = "--only" ]; then
 		only="$2"
 	fi
 
 	local line id image version os sapi label overlay
-	list_cpu_style_official_targets | while IFS='|' read -r id image version os sapi label; do
+	"$target_fn" | while IFS='|' read -r id image version os sapi label; do
 		[ -n "$only" ] && [[ "$id" != *"$only"* ]] && continue
 		overlay="$(ensure_overlay "$image" "$need_curl" "$need_imagick")"
 		run_in_target "$suite" "$id" "$overlay" php
@@ -234,13 +234,13 @@ cmd_bench() {
 	local suite="$1"
 	shift
 	case "$suite" in
-		cpu) bench_script_suite cpu 0 0 "$@" ;;
-		tls) bench_script_suite tls 1 0 "$@" ;;
+		cpu) bench_script_suite cpu 0 0 list_cpu_bench_targets "$@" ;;
+		tls) bench_script_suite tls 1 0 list_cpu_style_official_targets "$@" ;;
 		imagick)
 			if [ ! -f "${PROJECT_DIR}/bench/imagick/assets/bench.jpg" ]; then
 				bash "${PROJECT_DIR}/bench/imagick/generate-asset.sh"
 			fi
-			bench_script_suite imagick 0 1 "$@"
+			bench_script_suite imagick 0 1 list_cpu_style_official_targets "$@"
 			;;
 		throughput) bench_throughput_suite "$@" ;;
 		*)

@@ -53,10 +53,21 @@ list_official_targets() {
 	done
 }
 
-# Same, but CLI-only -- the relevant subset for per-script CPU/TLS/Imagick
-# benchmarks (fpm/apache/zts don't change the speed of `php script.php`).
+# Same, but CLI-only -- the relevant subset for TLS/Imagick benchmarks
+# (fpm/apache don't change the speed of `php script.php`; the CPU suite
+# uses list_cpu_bench_targets below instead, since zts *does* change it and
+# is exactly what that suite is for).
 list_cpu_style_official_targets() {
 	list_official_targets | awk -F'|' '$5 == "cli"'
+}
+
+# CLI + zts -- TSRM (thread-safety bookkeeping) adds real per-access
+# overhead to every global/static lookup even with a single thread running,
+# which is the "non-negligible" cost flagged in
+# https://github.com/docker-library/php/issues/742. Comparing it needs
+# nothing new: php:$version-zts-$os already exists as an official tag.
+list_cpu_bench_targets() {
+	list_official_targets | awk -F'|' '$5 == "cli" || $5 == "zts"'
 }
 
 distro_pkg_base_image() {
