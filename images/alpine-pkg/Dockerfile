@@ -18,6 +18,8 @@ RUN set -eux; \
 		"${PHP_PKG}-curl" \
 		"${PHP_PKG}-pecl-imagick" \
 		"${PHP_PKG}-openssl" \
+		openssl \
+		imagemagick-jpeg \
 		ca-certificates \
 	; \
 	# Alpine deliberately doesn't provide an unversioned "php" (its package

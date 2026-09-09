@@ -18,7 +18,10 @@ if command -v apt-get >/dev/null 2>&1; then
 	apt-get install -y --no-install-recommends libmagickwand-dev $PHPIZE_DEPS
 	rm -rf /var/lib/apt/lists/*
 elif command -v apk >/dev/null 2>&1; then
-	apk add --no-cache imagemagick-dev libtool $PHPIZE_DEPS
+	# Alpine packages codec support separately from the library itself --
+	# without imagemagick-jpeg, ImageMagick has "no decode delegate" for
+	# the JPEG test asset (bench/imagick/assets/bench.jpg).
+	apk add --no-cache imagemagick-dev imagemagick-jpeg libtool $PHPIZE_DEPS
 else
 	echo "no supported package manager found" >&2
 	exit 1

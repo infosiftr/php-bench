@@ -198,18 +198,39 @@ bench_throughput_target() {
 			;;
 	esac
 
-	# Reuses the tls suite's port-wait script rather than adding another one.
+	local scripts_dir="${PROJECT_DIR}/bench/throughput/scripts"
 	docker run --rm --network "$THROUGHPUT_NETWORK" \
-		-v "${PROJECT_DIR}/bench/tls/scripts:/scripts:ro" \
-		php:cli-alpine php /scripts/wait-for-port.php "$THROUGHPUT_SERVER" 80
+		-v "${scripts_dir}:/scripts:ro" \
+		php:cli php /scripts/wait-for-http.php "http://${THROUGHPUT_SERVER}/"
 
+	# Multiple trials against the same already-warm server, not one sample:
+	# a single load.php run is as susceptible to host noise as any one
+	# hyperfine sample would be, and unlike the other suites (where
+	# hyperfine itself takes ~15-20 samples), nothing here averages that
+	# out unless we do it ourselves.
 	local out_dir="${RESULTS_DIR}/throughput"
 	mkdir -p "$out_dir"
-	docker run --rm --network "$THROUGHPUT_NETWORK" \
-		-v "${PROJECT_DIR}/bench/throughput/scripts:/scripts:ro" \
-		php:cli \
-		php /scripts/load.php "http://${THROUGHPUT_SERVER}/" "${LOAD_CONCURRENCY:-20}" "${LOAD_DURATION:-8}" \
-		> "${out_dir}/throughput-${id}.json"
+	local trials=() trial_json n
+	for n in $(seq 1 "${LOAD_TRIALS:-3}"); do
+		trial_json="$(docker run --rm --network "$THROUGHPUT_NETWORK" \
+			-v "${scripts_dir}:/scripts:ro" \
+			php:cli \
+			php /scripts/load.php "http://${THROUGHPUT_SERVER}/" "${LOAD_CONCURRENCY:-20}" "${LOAD_DURATION:-8}")"
+		trials+=("$trial_json")
+	done
+	printf '%s\n' "${trials[@]}" | jq -s '{
+		trials: .,
+		median: {
+			requests: (map(.requests) | sort | .[length/2 | floor]),
+			errors: (map(.errors) | add),
+			rps: (map(.rps) | sort | .[length/2 | floor]),
+			p50_ms: (map(.p50_ms) | sort | .[length/2 | floor]),
+			p95_ms: (map(.p95_ms) | sort | .[length/2 | floor]),
+			p99_ms: (map(.p99_ms) | sort | .[length/2 | floor])
+		},
+		rps_min: (map(.rps) | min),
+		rps_max: (map(.rps) | max)
+	}' > "${out_dir}/throughput-${id}.json"
 
 	docker rm -f "$THROUGHPUT_SERVER" "$THROUGHPUT_FPM" >/dev/null 2>&1 || true
 }
@@ -268,13 +289,13 @@ cmd_report() {
 
 	local file base target_id
 	if [ "$suite" = throughput ]; then
-		echo "target_id,requests,errors,duration_s,rps,p50_ms,p95_ms,p99_ms"
+		echo "target_id,requests,errors,rps,p50_ms,p95_ms,p99_ms,rps_min,rps_max"
 		for file in "$dir"/"${suite}"-*.json; do
 			[ -e "$file" ] || continue
 			base="$(basename "$file" .json)"
 			target_id="${base#"${suite}"-}"
 			jq -r --arg tid "$target_id" '
-				[$tid, .requests, .errors, .duration_s, .rps, .p50_ms, .p95_ms, .p99_ms] | @csv
+				[$tid, .median.requests, .median.errors, .median.rps, .median.p50_ms, .median.p95_ms, .median.p99_ms, .rps_min, .rps_max] | @csv
 			' "$file"
 		done
 	else
