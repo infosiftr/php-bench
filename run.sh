@@ -158,11 +158,14 @@ bench_script_suite() {
 THROUGHPUT_NETWORK="php-bench-throughput"
 THROUGHPUT_SERVER="php-bench-throughput-server"
 THROUGHPUT_FPM="php-bench-throughput-fpm"
+THROUGHPUT_SOCK_VOLUME="php-bench-throughput-sock"
 
 # bench_throughput_target ID VERSION OS MODE -- starts the server (apache
-# mpm_prefork, or fpm+nginx) on a private docker network, waits for it to
-# accept connections, points bench/throughput/scripts/load.php at it, and
-# tears the containers down again. See bench/throughput/app/index.php and
+# mpm_prefork, or fpm+nginx talking over a Unix socket -- the way fpm+nginx
+# is actually deployed in practice, not a cross-container TCP hop) on a
+# private docker network, waits for it to serve real 200s, points
+# bench/throughput/scripts/load.php at it, and tears the containers down
+# again. See bench/throughput/app/index.php and
 # https://github.com/docker-library/php/issues/681 for what this compares
 # (and targets.sh for why mpm_event isn't one of the modes).
 bench_throughput_target() {
@@ -184,12 +187,16 @@ bench_throughput_target() {
 			local fpm_image; fpm_image="$(official_image "$version" fpm "$os")"
 			ensure_pulled "$fpm_image"
 			ensure_pulled nginx:stable
-			docker run -d --rm --name "$THROUGHPUT_FPM" --network "$THROUGHPUT_NETWORK" --network-alias fpm-backend \
+			docker volume inspect "$THROUGHPUT_SOCK_VOLUME" >/dev/null 2>&1 || docker volume create "$THROUGHPUT_SOCK_VOLUME" >/dev/null
+			docker run -d --rm --name "$THROUGHPUT_FPM" --network "$THROUGHPUT_NETWORK" \
 				-v "${app_dir}:/var/www/html:ro" \
+				-v "${PROJECT_DIR}/bench/throughput/fpm/zz-socket.conf:/usr/local/etc/php-fpm.d/zz-socket.conf:ro" \
+				-v "${THROUGHPUT_SOCK_VOLUME}:/run/php" \
 				"$fpm_image" >/dev/null
 			docker run -d --rm --name "$THROUGHPUT_SERVER" --network "$THROUGHPUT_NETWORK" \
 				-v "${app_dir}:/var/www/html:ro" \
 				-v "${PROJECT_DIR}/bench/throughput/nginx/nginx.conf:/etc/nginx/nginx.conf:ro" \
+				-v "${THROUGHPUT_SOCK_VOLUME}:/run/php" \
 				nginx:stable >/dev/null
 			;;
 		*)
