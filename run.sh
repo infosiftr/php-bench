@@ -82,6 +82,7 @@ Commands:
   bench imagick    [--only PATTERN]   Run the Imagick resize suite
   bench throughput [--only PATTERN]   Run the apache/fpm throughput suite
   report <suite>                      Print results/<suite>/*.json as CSV
+  summarize                           Print the fixed cross-suite comparisons (summarize.jq)
 EOF
 }
 
@@ -318,6 +319,10 @@ cmd_report() {
 	fi
 }
 
+cmd_summarize() {
+	"${PROJECT_DIR}/summarize.jq" "${RESULTS_DIR}"/*/*.json
+}
+
 main() {
 	local command="${1:-}"
 	[ -z "$command" ] && { usage; exit 1; }
@@ -327,6 +332,7 @@ main() {
 		build-distro-pkg) cmd_build_distro_pkg "$@" ;;
 		bench) cmd_bench "$@" ;;
 		report) cmd_report "$@" ;;
+		summarize) cmd_summarize "$@" ;;
 		-h|--help|help) usage ;;
 		*) echo "unknown command: $command" >&2; usage; exit 2 ;;
 	esac

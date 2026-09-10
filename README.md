@@ -19,6 +19,7 @@ specific "PHP is slow" complaints on file there:
 ./run.sh bench cpu             # or tls, imagick, throughput
 ./run.sh bench cpu --only 8.4  # filter targets by substring
 ./run.sh report cpu            # results/cpu/*.json -> CSV on stdout
+./run.sh summarize             # fixed comparisons + version-consistency checks
 ```
 
 Requires Docker. First run of `bench imagick` renders the fixed test image
@@ -38,3 +39,7 @@ Requires Docker. First run of `bench imagick` renders the fixed test image
 - `results/<suite>/*.json` -- one file per target: hyperfine's
   `--export-json` output for cpu/tls/imagick, `load.php`'s own JSON for
   throughput.
+- `summarize.jq` -- reads all of the above and prints six fixed comparisons
+  (one per question above), each collapsed across PHP version with a
+  spread/consistency check rather than silently averaging it away. Runnable
+  directly (`./summarize.jq results/*/*.json`) or via `run.sh summarize`.
