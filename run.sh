@@ -3,7 +3,7 @@ set -Eeuo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_DIR"
 
-source targets.sh
+source .targets.sh
 
 RESULTS_DIR="${PROJECT_DIR}/results"
 
@@ -128,7 +128,7 @@ cmd_build_distro_pkg() {
 # bench_script_suite SUITE NEED_CURL NEED_IMAGICK TARGET_FN [--only PATTERN]
 # Shared driver for cpu/tls/imagick: all three run one script (or a fixed
 # script list) via bench/<suite>/run.sh against every target TARGET_FN
-# lists (a targets.sh list_*_targets function) plus every distro-pkg target.
+# lists (a .targets.sh list_*_targets function) plus every distro-pkg target.
 bench_script_suite() {
 	local suite="$1" need_curl="$2" need_imagick="$3" target_fn="$4"
 	shift 4
@@ -167,7 +167,7 @@ THROUGHPUT_SOCK_VOLUME="php-bench-throughput-sock"
 # bench/throughput/scripts/load.php at it, and tears the containers down
 # again. See bench/throughput/app/index.php and
 # https://github.com/docker-library/php/issues/681 for what this compares
-# (and targets.sh for why mpm_event isn't one of the modes).
+# (and .targets.sh for why mpm_event isn't one of the modes).
 bench_throughput_target() {
 	local id="$1" version="$2" os="$3" mode="$4"
 	echo "=== throughput: ${id} ===" >&2

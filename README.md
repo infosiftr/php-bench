@@ -10,7 +10,7 @@ specific "PHP is slow" complaints on file there:
 - apache vs fpm throughput: https://github.com/docker-library/php/issues/681
   (mpm_event, discussed in https://github.com/docker-library/php/issues/742,
   isn't one of the modes -- the official apache image is NTS and Apache
-  refuses to load it under a threaded MPM; see targets.sh)
+  refuses to load it under a threaded MPM; see .targets.sh)
 
 ## Use
 
@@ -26,7 +26,7 @@ Requires Docker. First run of `bench imagick` renders the fixed test image
 
 ## Layout
 
-- `targets.sh` -- the version/OS/SAPI matrix.
+- `.targets.sh` -- the version/OS/SAPI matrix.
 - `images/` -- Dockerfiles: `debian-pkg`/`alpine-pkg` (vanilla distro + its
   own packaged PHP), `overlay` (adds hyperfine, and curl/imagick compiled
   against *our* PHP when needed), `asset-gen` (one-off, for the Imagick
