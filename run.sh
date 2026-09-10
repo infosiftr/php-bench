@@ -7,15 +7,98 @@ source .targets.sh
 
 RESULTS_DIR="${PROJECT_DIR}/results"
 
+# Set by global --pull[=never|missing|always] / --build[=never|missing|always]
+# flags (see main, which recognizes both anywhere in argv for any command),
+# or PHP_BENCH_PULL_POLICY / PHP_BENCH_BUILD_POLICY in the environment for
+# a persistent default. Two separate knobs because they answer two
+# different questions: PULL_POLICY is about the freshness of third-party
+# base images (php:8.2-cli-bookworm etc., which docker-library rebuilds
+# continuously); BUILD_POLICY is about the freshness of *our own*
+# Dockerfile-derived images (images/overlay, images/*-pkg) after *we*
+# change something -- e.g. editing install-imagick.sh doesn't touch any
+# base tag, so PULL_POLICY=always wouldn't rebuild the overlay that
+# actually needs it; that's what BUILD_POLICY is for. Once an
+# overlay/distro-pkg tag exists locally, neither ensure_overlay nor
+# ensure_distro_pkg looks past it again unless told to.
+#   missing -- acquire only what's not already present locally.
+#   always  -- ignore the local cache and (re)acquire everything.
+#   never   -- use only what's already present; error out (rather than
+#              silently acquiring, or silently proceeding and letting a
+#              later `docker run` fail worse) if something's missing.
+#
+# Different defaults for a structural reason, not just to be conservative:
+# `docker pull` is a mandatory registry round-trip *every* invocation (even
+# when already current -- measured ~2.7s), multiplied across dozens of
+# targets, for a freshness check we rarely need mid-session. `docker build`
+# has a real local cache-hit path with no network involved: measured
+# <1s once warm, only paying real time (still local, no network) the one
+# time something we actually wrote changes. So PULL_POLICY defaults
+# conservatively (missing); BUILD_POLICY defaults to always, since it's
+# nearly free in the steady state and it's the only thing that would have
+# caught us silently benchmarking a stale overlay after editing
+# install-imagick.sh -- which happened, by hand, more than once.
+: "${PULL_POLICY:=${PHP_BENCH_PULL_POLICY:-missing}}"
+: "${BUILD_POLICY:=${PHP_BENCH_BUILD_POLICY:-always}}"
+
 image_exists() {
 	docker image inspect "$1" >/dev/null 2>&1
 }
 
+# needs_acquire POLICY TAG -- true if an ensure_* function should go ahead
+# and pull/build TAG, given POLICY (the caller's PULL_POLICY or
+# BUILD_POLICY, as appropriate).
+needs_acquire() {
+	local policy="$1" tag="$2"
+	case "$policy" in
+		always) return 0 ;;
+		missing) ! image_exists "$tag" ;;
+		never)
+			if image_exists "$tag"; then
+				return 1
+			fi
+			echo "error: $tag is missing locally and policy=never" >&2
+			exit 1
+			;;
+		*)
+			echo "error: invalid policy '$policy' (expected never, missing, or always)" >&2
+			exit 2
+			;;
+	esac
+}
+
 # docker_build TAG DOCKERFILE CONTEXT [BUILD_ARG=VALUE ...]
+#
+# Also ensure_pulls every image DOCKERFILE's FROM line(s) resolve to (after
+# substituting the BUILD_ARG=VALUE pairs we were given, since ours are all
+# `ARG BASE_IMAGE` + `FROM ${BASE_IMAGE}`), respecting PULL_POLICY. Plain
+# `docker build` won't do this for us: without --pull, it silently reuses
+# whatever's already local for FROM regardless of staleness, which used to
+# mean PULL_POLICY had no effect at all on ensure_distro_pkg's base image
+# (debian:trixie etc.) -- it never called ensure_pulled for its own FROM,
+# unlike ensure_overlay, which had to remember to do that explicitly.
+# Centralizing it here means every caller gets it for free and correctly,
+# instead of each one needing to remember.
 docker_build() {
 	local tag="$1" dockerfile="$2" context="$3"
 	shift 3
+
+	local froms from
+	froms="$(awk 'toupper($1) == "FROM" { print $2 }' "$dockerfile")"
+	for from in $froms; do
+		local kv arg_name arg_value
+		for kv in "$@"; do
+			arg_name="${kv%%=*}"
+			arg_value="${kv#*=}"
+			from="${from//\$\{$arg_name\}/$arg_value}"
+			from="${from//\$$arg_name/$arg_value}"
+		done
+		ensure_pulled "$from"
+	done
+
 	local args=(docker build -t "$tag" -f "$dockerfile")
+	# --pull here is about the *base* image inside the build, i.e. a
+	# PULL_POLICY concern, not a BUILD_POLICY one -- see the comment above.
+	[ "$PULL_POLICY" = always ] && args+=(--pull)
 	local kv
 	for kv in "$@"; do
 		args+=(--build-arg "$kv")
@@ -38,7 +121,7 @@ ensure_distro_pkg() {
 	else
 		dockerfile="${PROJECT_DIR}/images/alpine-pkg/Dockerfile"
 	fi
-	if ! image_exists "$tag"; then
+	if needs_acquire "$BUILD_POLICY" "$tag"; then
 		docker_build "$tag" "$dockerfile" "$(dirname "$dockerfile")" "BASE_IMAGE=${base}" >&2
 	fi
 	echo "$tag"
@@ -47,7 +130,7 @@ ensure_distro_pkg() {
 # ensure_pulled TAG -- pulls if not already present locally
 ensure_pulled() {
 	local tag="$1"
-	if ! image_exists "$tag"; then
+	if needs_acquire "$PULL_POLICY" "$tag"; then
 		echo "+ docker pull $tag" >&2
 		docker pull "$tag" >&2
 	fi
@@ -62,8 +145,9 @@ ensure_overlay() {
 	local base_image="$1" need_curl="$2" need_imagick="$3"
 	local safe_base; safe_base="$(echo "$base_image" | tr '/:' '__')"
 	local tag="php-bench/overlay:${safe_base}-c${need_curl}-i${need_imagick}"
-	if ! image_exists "$tag"; then
-		ensure_pulled "$base_image"
+	if needs_acquire "$BUILD_POLICY" "$tag"; then
+		# docker_build itself ensure_pulls BASE_IMAGE (via the Dockerfile's
+		# own FROM line) according to PULL_POLICY -- no need to do it here too.
 		docker_build "$tag" "${PROJECT_DIR}/images/overlay/Dockerfile" "${PROJECT_DIR}/images/overlay" \
 			"BASE_IMAGE=${base_image}" "NEED_CURL=${need_curl}" "NEED_IMAGICK=${need_imagick}" >&2
 	fi
@@ -77,12 +161,19 @@ Usage: run.sh <command> [args]
 Commands:
   list                                Show the full target matrix
   build-distro-pkg [os...]            Build distro-pkg images (default: all)
+  ensure-images                       Build/pull every image every suite needs
   bench cpu        [--only PATTERN]   Run the CPU microbenchmark suite
   bench tls        [--only PATTERN]   Run the TLS/CA-verification suite
   bench imagick    [--only PATTERN]   Run the Imagick resize suite
   bench throughput [--only PATTERN]   Run the apache/fpm throughput suite
   report <suite>                      Print results/<suite>/*.json as CSV
   summarize                           Print the fixed cross-suite comparisons (summarize.jq)
+
+Global flags (valid anywhere in argv, for any command):
+  --pull[=never|missing|always]       Third-party base image freshness (default missing)
+  --build[=never|missing|always]      Our own overlay/distro-pkg image freshness (default always)
+                                       (bare --pull/--build means always; also settable via
+                                       PHP_BENCH_PULL_POLICY / PHP_BENCH_BUILD_POLICY)
 EOF
 }
 
@@ -259,6 +350,36 @@ bench_throughput_suite() {
 	done
 }
 
+# cmd_ensure_images -- builds/pulls every image every suite needs, without
+# running any benchmarks, so that cost can be its own CI step instead of
+# smeared invisibly across each `bench` step's timing. The cpu/tls/imagick
+# overlays are real `docker build`s (compiling imagick against pecl is the
+# slow one, ~1 min per official cli target), not just pulls of something
+# that already exists -- hence "ensure", not "pull". Takes no args of its
+# own: the --pull/--build flags that shape what "ensure" actually does are
+# global (see main), not specific to this command.
+cmd_ensure_images() {
+	local os
+	for os in "${OSES[@]}"; do
+		local built; built="$(ensure_distro_pkg "$os")"
+		ensure_overlay "$built" 0 0 >/dev/null
+	done
+
+	local id image version target_os sapi label
+	list_cpu_bench_targets | while IFS='|' read -r id image version target_os sapi label; do
+		ensure_overlay "$image" 0 0 >/dev/null
+	done
+	list_cpu_style_official_targets | while IFS='|' read -r id image version target_os sapi label; do
+		ensure_overlay "$image" 1 0 >/dev/null
+		ensure_overlay "$image" 0 1 >/dev/null
+	done
+
+	list_official_targets | awk -F'|' '$5 == "apache" || $5 == "fpm"' | while IFS='|' read -r id image version target_os sapi label; do
+		ensure_pulled "$image"
+	done
+	ensure_pulled nginx:stable
+}
+
 cmd_bench() {
 	local suite="$1"
 	shift
@@ -324,12 +445,44 @@ cmd_summarize() {
 }
 
 main() {
+	# --pull/--build are global: recognized anywhere in argv, for any
+	# command, not just `ensure-images` -- e.g. `run.sh bench cpu --pull`
+	# force-refreshes cpu's own images before running it, with no separate
+	# `ensure-images` step needed.
+	local args=() arg
+	for arg in "$@"; do
+		case "$arg" in
+			--pull) PULL_POLICY=always ;;
+			--pull=*) PULL_POLICY="${arg#--pull=}" ;;
+			--build) BUILD_POLICY=always ;;
+			--build=*) BUILD_POLICY="${arg#--build=}" ;;
+			*) args+=("$arg") ;;
+		esac
+	done
+	set -- "${args[@]}"
+
+	case "$PULL_POLICY" in
+		never | missing | always) ;;
+		*)
+			echo "error: invalid --pull value '$PULL_POLICY' (expected never, missing, or always)" >&2
+			exit 2
+			;;
+	esac
+	case "$BUILD_POLICY" in
+		never | missing | always) ;;
+		*)
+			echo "error: invalid --build value '$BUILD_POLICY' (expected never, missing, or always)" >&2
+			exit 2
+			;;
+	esac
+
 	local command="${1:-}"
 	[ -z "$command" ] && { usage; exit 1; }
 	shift || true
 	case "$command" in
 		list) cmd_list "$@" ;;
 		build-distro-pkg) cmd_build_distro_pkg "$@" ;;
+		ensure-images) cmd_ensure_images "$@" ;;
 		bench) cmd_bench "$@" ;;
 		report) cmd_report "$@" ;;
 		summarize) cmd_summarize "$@" ;;

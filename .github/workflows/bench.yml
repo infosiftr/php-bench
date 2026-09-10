@@ -24,12 +24,24 @@ jobs:
   bench:
     name: Benchmark
     runs-on: ubuntu-latest
+    # never, for every step by default: ensure-images below is the only
+    # line allowed to pull/build anything, via an explicit override. If a
+    # later step ever needs an image ensure-images didn't already cover
+    # (its target list drifted out of sync with what `bench` actually
+    # needs, say), that's a bug we want a loud CI failure for, not a
+    # silent extra pull/build quietly corrupting that step's timing.
+    env:
+      PHP_BENCH_PULL_POLICY: never
+      PHP_BENCH_BUILD_POLICY: never
     steps:
       - uses: tianon/actions/checkout/composite@169a61f86f2bdd62a21837ab30aeb1ea4c23bdbe # HEAD
 
-      - name: cpu
-        run: ./run.sh bench cpu
+      - name: ensure-images
+        run: ./run.sh ensure-images --pull --build
 
+      # fastest to slowest, now that ensure-images has moved pull/build cost
+      # out of each of these -- cpu is last by a wide margin (36 targets, and
+      # its deliberately-slow bcrypt hash script run 3 ways on every one)
       - name: tls
         run: ./run.sh bench tls
 
@@ -38,6 +50,9 @@ jobs:
 
       - name: throughput
         run: ./run.sh bench throughput
+
+      - name: cpu
+        run: ./run.sh bench cpu
 
       - name: summary
         run: ./run.sh summarize | tee -a "$GITHUB_STEP_SUMMARY"
