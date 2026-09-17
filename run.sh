@@ -82,7 +82,7 @@ docker_build() {
 	local tag="$1" dockerfile="$2" context="$3"
 	shift 3
 
-	local froms from
+	local froms from local_from=0
 	froms="$(awk 'toupper($1) == "FROM" { print $2 }' "$dockerfile")"
 	for from in $froms; do
 		local kv arg_name arg_value
@@ -92,13 +92,23 @@ docker_build() {
 			from="${from//\$\{$arg_name\}/$arg_value}"
 			from="${from//\$$arg_name/$arg_value}"
 		done
-		ensure_pulled "$from"
+		# php-bench/* is always one of *our own* locally-built tags (e.g.
+		# ensure_overlay building on top of a distro-pkg image) -- it's
+		# never been published anywhere, so there is nothing to pull. Call
+		# order already guarantees it exists by now (whichever ensure_*
+		# produced this tag ran, and returned it, before we got here);
+		# `docker pull` on it -- or `docker build --pull`, which tries to
+		# re-check it against a registry too -- can only ever fail.
+		case "$from" in
+			php-bench/*) local_from=1 ;;
+			*) ensure_pulled "$from" ;;
+		esac
 	done
 
 	local args=(docker build -t "$tag" -f "$dockerfile")
 	# --pull here is about the *base* image inside the build, i.e. a
 	# PULL_POLICY concern, not a BUILD_POLICY one -- see the comment above.
-	[ "$PULL_POLICY" = always ] && args+=(--pull)
+	[ "$PULL_POLICY" = always ] && [ "$local_from" = 0 ] && args+=(--pull)
 	local kv
 	for kv in "$@"; do
 		args+=(--build-arg "$kv")
