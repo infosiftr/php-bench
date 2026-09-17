@@ -49,9 +49,13 @@ Requires Docker. First run of `bench imagick` renders the fixed test image
   against *our* PHP when needed), `asset-gen` (one-off, for the Imagick
   test image).
 - `bench/<suite>/` -- the PHP scripts being timed. cpu/tls/imagick each have
-  a `run.sh` that hyperfine-invokes them inside the target container;
-  throughput is multi-container (server + nginx/fpm + a curl_multi load
-  driver), so its orchestration lives in `run.sh` at the repo root instead.
+  a `run.sh` that hyperfine-invokes them inside the target container,
+  redirecting hyperfine's own verbose per-benchmark output and printing a
+  compact one-line-per-result summary instead via `bench/summarize-hyperfine.php`
+  (reads the same `--export-json` file, rather than parsing hyperfine's
+  human-readable text); throughput is multi-container (server + nginx/fpm +
+  a curl_multi load driver), so its orchestration lives in `run.sh` at the
+  repo root instead.
 - `results/<suite>/*.json` -- one file per target: hyperfine's
   `--export-json` output for cpu/tls/imagick, `load.php`'s own JSON for
   throughput.

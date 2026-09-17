@@ -188,6 +188,8 @@ run_in_target() {
 	docker run --rm \
 		-v "${PROJECT_DIR}/bench/${suite}:/bench:ro" \
 		-v "${out_dir}:/results" \
+		-v "${PROJECT_DIR}/bench/summarize-hyperfine.php:/summarize-hyperfine.php:ro" \
+		-v "${PROJECT_DIR}/bench/merge-hyperfine.php:/merge-hyperfine.php:ro" \
 		-e "TARGET_ID=${target_id}" \
 		-e "RESULTS_DIR=/results" \
 		-e "PHP_BIN=${php_bin}" \

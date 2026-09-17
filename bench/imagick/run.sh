@@ -17,6 +17,10 @@ if [ ! -r "$ASSET" ]; then
 	exit 1
 fi
 
-hyperfine --warmup 2 --min-runs 15 \
+echo "Running: resize" >&2
+hyperfine \
+	--warmup 2 --min-runs 15 \
 	--export-json "${OUT_DIR}/imagick-${TARGET_ID}.json" \
-	--command-name resize "${PHP_BIN} scripts/resize.php ${ASSET} 4000 --quiet"
+	--command-name resize "${PHP_BIN} scripts/resize.php ${ASSET} 4000 --quiet" \
+	>/dev/null
+php /summarize-hyperfine.php "${OUT_DIR}/imagick-${TARGET_ID}.json"
