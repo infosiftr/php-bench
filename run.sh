@@ -287,21 +287,33 @@ bench_throughput_target() {
 				-v "${app_dir}:/var/www/html:ro" \
 				"$image" >/dev/null
 			;;
-		fpm-nginx)
+		fpm-nginx | fpm-httpd)
+			# Same backend either way -- fpm-nginx and fpm-httpd only
+			# differ in which image fronts it, so the FPM half is shared
+			# rather than duplicated per mode.
 			local fpm_image; fpm_image="$(official_image "$version" fpm "$os")"
 			ensure_pulled "$fpm_image"
-			ensure_pulled nginx:stable
 			docker volume inspect "$THROUGHPUT_SOCK_VOLUME" >/dev/null 2>&1 || docker volume create "$THROUGHPUT_SOCK_VOLUME" >/dev/null
 			docker run -d --rm --name "$THROUGHPUT_FPM" --network "$THROUGHPUT_NETWORK" \
 				-v "${app_dir}:/var/www/html:ro" \
 				-v "${PROJECT_DIR}/bench/throughput/fpm/zz-socket.conf:/usr/local/etc/php-fpm.d/zz-socket.conf:ro" \
 				-v "${THROUGHPUT_SOCK_VOLUME}:/run/php" \
 				"$fpm_image" >/dev/null
-			docker run -d --rm --name "$THROUGHPUT_SERVER" --network "$THROUGHPUT_NETWORK" \
-				-v "${app_dir}:/var/www/html:ro" \
-				-v "${PROJECT_DIR}/bench/throughput/nginx/nginx.conf:/etc/nginx/nginx.conf:ro" \
-				-v "${THROUGHPUT_SOCK_VOLUME}:/run/php" \
-				nginx:stable >/dev/null
+			if [[ "$mode" == fpm-nginx ]]; then
+				ensure_pulled nginx:stable
+				docker run -d --rm --name "$THROUGHPUT_SERVER" --network "$THROUGHPUT_NETWORK" \
+					-v "${app_dir}:/var/www/html:ro" \
+					-v "${PROJECT_DIR}/bench/throughput/nginx/nginx.conf:/etc/nginx/nginx.conf:ro" \
+					-v "${THROUGHPUT_SOCK_VOLUME}:/run/php" \
+					nginx:stable >/dev/null
+			else
+				ensure_pulled httpd:latest
+				docker run -d --rm --name "$THROUGHPUT_SERVER" --network "$THROUGHPUT_NETWORK" \
+					-v "${app_dir}:/var/www/html:ro" \
+					-v "${PROJECT_DIR}/bench/throughput/httpd/httpd.conf:/usr/local/apache2/conf/httpd.conf:ro" \
+					-v "${THROUGHPUT_SOCK_VOLUME}:/run/php" \
+					httpd:latest >/dev/null
+			fi
 			;;
 		*)
 			echo "unknown throughput mode: $mode" >&2
@@ -390,6 +402,7 @@ cmd_ensure_images() {
 		ensure_pulled "$image"
 	done
 	ensure_pulled nginx:stable
+	ensure_pulled httpd:latest
 }
 
 cmd_bench() {

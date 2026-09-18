@@ -99,7 +99,10 @@ list_distro_pkg_targets() {
 }
 
 # Emits "id|version|os|mode|label" for the apache/fpm architecture
-# comparison. Only prefork and fpm-nginx are here, not the mpm_event swap
+# comparison. apache-prefork and fpm-nginx are here, plus fpm-httpd (the
+# official httpd image fronting the same php-fpm backend via
+# mod_proxy_fcgi, an apples-to-apples alternative to fpm-nginx rather than
+# a third architecture). Not here: the mpm_event swap
 # https://github.com/docker-library/php/issues/742 discusses: the official
 # apache image is an NTS build, and Apache refuses to load a non-thread-safe
 # PHP module under a threaded MPM (mpm_event/mpm_worker) -- confirmed by
@@ -112,9 +115,9 @@ list_throughput_targets() {
 	local version os mode
 	for version in "${PHP_VERSIONS[@]}"; do
 		for os in "${DEBIAN_OSES[@]}"; do  # apache variant is Debian-only
-			for mode in apache-prefork fpm-nginx; do
-				local sapi=apache
-				[[ "$mode" == fpm-nginx ]] && sapi=fpm
+			for mode in apache-prefork fpm-nginx fpm-httpd; do
+				local sapi=fpm
+				[[ "$mode" == apache-prefork ]] && sapi=apache
 				echo "throughput-${version}-${os}-${mode}|${version}|${os}|${mode}|php:${version}-${sapi}-${os} [${mode}]"
 			done
 		done
