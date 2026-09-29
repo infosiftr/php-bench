@@ -63,3 +63,13 @@ Requires Docker. First run of `bench imagick` renders the fixed test image
   (one per question above), each collapsed across PHP version with a
   spread/consistency check rather than silently averaging it away. Runnable
   directly (`./summarize.jq results/*/*.json`) or via `run.sh summarize`.
+  The report leads with a plain-language answer to each of the six
+  questions, and every comparison names its winner in words ("official 15%
+  faster") rather than leaving a signed percentage to be interpreted.
+  A winner is named only when the gap beats the uncertainty: hyperfine's
+  per-benchmark `stddev` and the disagreement between PHP versions are
+  both carried through the aggregation, and the gap has to clear whichever
+  of the two is larger, plus a 1% floor for effects too small to act on.
+  Everything else reads "too close to call". That discards more than it
+  might sound like: `arrays` carries ~19% run-to-run stddev, so any
+  single-digit delta on it is scatter rather than a result.
