@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+# Without this, bash clears -e inside every $(...): a failing command there
+# doesn't stop the function it's in, so with ensure_* and resolve_* nested
+# several $(...) deep, an error (a failed build, a bad tag) would be
+# swallowed and surface much later as something confusing.
+shopt -s inherit_errexit
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_DIR"
 
@@ -137,6 +142,204 @@ ensure_distro_pkg() {
 	echo "$tag"
 }
 
+# Where ensure_nts finds docker-library/php's Dockerfiles: a checkout we
+# shallow-clone into .cache/ ourselves, or -- like BASHBREW_LIBRARY-style
+# overrides elsewhere -- a directory of the caller's own (a local checkout,
+# say, pinned to the commit the published images were built from) via
+# PHP_BENCH_DOCKER_PHP_DIR, which is then used as-is and never touched.
+DOCKER_PHP_REPO="https://github.com/docker-library/php.git"
+: "${DOCKER_PHP_DIR:=${PHP_BENCH_DOCKER_PHP_DIR:-}}"
+
+# ensure_docker_php_checkout -> echoes the checkout directory. Follows
+# PULL_POLICY, since it is the same kind of thing: someone else's source of
+# truth that moves on its own. (always re-fetches on *every* call, and a
+# run calls this once per OS; if upstream moved between two of them, the
+# PHP_VERSION check in ensure_nts catches the skew.)
+ensure_docker_php_checkout() {
+	if [ -n "$DOCKER_PHP_DIR" ]; then
+		echo "$DOCKER_PHP_DIR"
+		return
+	fi
+	local dir="${PROJECT_DIR}/.cache/docker-library-php"
+	if [ ! -d "$dir/.git" ]; then
+		if [ "$PULL_POLICY" = never ]; then
+			echo "error: $dir is missing and policy=never" >&2
+			exit 1
+		fi
+		git clone --depth=1 "$DOCKER_PHP_REPO" "$dir" >&2
+	elif [ "$PULL_POLICY" = always ]; then
+		git -C "$dir" fetch --depth=1 origin HEAD >&2
+		git -C "$dir" reset --hard FETCH_HEAD >&2
+	fi
+	echo "$dir"
+}
+
+# image_php_version IMAGE -> the PHP_VERSION env var baked into IMAGE
+image_php_version() {
+	docker image inspect --format '{{json .Config.Env}}' "$1" \
+		| jq --raw-output 'map(select(startswith("PHP_VERSION="))) | .[0] | sub("^PHP_VERSION="; "")'
+}
+
+# ensure_nts VERSION OS -> builds/reuses php-bench/nts:$VERSION-cli-$OS and
+# echoes the tag. Only for when php:$VERSION-cli-$OS is itself ZTS and
+# docker-library hasn't published an NTS tag (resolve_cpu_pair decides
+# that): it's that image's own Dockerfile from docker-library/php with its
+# ZTS flags (--enable-zts, plus --disable-zend-signals, which the template
+# only emits alongside it) removed just-in-time into a scratch build
+# context. Nothing of upstream's is copied into this repo: that way the NTS
+# build can't drift from the ZTS one by anything but the flags this
+# function removes, and it fails (rather than quietly building something
+# that is still ZTS) if those flags aren't where we expect them.
+ensure_nts() {
+	local version="$1" os="$2"
+	local tag; tag="$(nts_built_image "$version" "$os")"
+	local zts_image; zts_image="$(official_image "$version" cli "$os")"
+	ensure_pulled "$zts_image"
+
+	if needs_acquire "$BUILD_POLICY" "$tag"; then
+		local checkout; checkout="$(ensure_docker_php_checkout)"
+		local src_dir="${checkout}/${version}/${os}/cli"
+		if [ ! -f "${src_dir}/Dockerfile" ]; then
+			echo "error: no Dockerfile at ${src_dir}" >&2
+			exit 1
+		fi
+		local ctx; ctx="$(mktemp --directory)"
+		cp --recursive "${src_dir}/." "${ctx}/"
+		if ! grep --quiet -- '--enable-zts' "${ctx}/Dockerfile"; then
+			echo "error: ${src_dir}/Dockerfile has no --enable-zts to remove; has upstream changed how it builds ${version}?" >&2
+			rm --recursive --force "$ctx"
+			exit 1
+		fi
+		sed --in-place \
+			-e '/--enable-zts/d' \
+			-e '/--disable-zend-signals/d' \
+			-e '/externals\.io\/message\/118859/d' \
+			"${ctx}/Dockerfile"
+		if grep --quiet -e '--enable-zts' -e 'zend-signals' "${ctx}/Dockerfile"; then
+			echo "error: ZTS flags survived stripping ${src_dir}/Dockerfile" >&2
+			rm --recursive --force "$ctx"
+			exit 1
+		fi
+		docker_build "$tag" "${ctx}/Dockerfile" "$ctx" >&2 || {
+			rm --recursive --force "$ctx"
+			exit 1
+		}
+		rm --recursive --force "$ctx"
+	fi
+
+	local want got
+	want="$(image_php_version "$zts_image")"
+	got="$(image_php_version "$tag")"
+	if [ "$want" != "$got" ]; then
+		echo "error: $tag is PHP $got but $zts_image is PHP $want, so they are not comparable; rebuild with --build --pull, or point PHP_BENCH_DOCKER_PHP_DIR at a docker-library/php checkout from the commit that published $zts_image" >&2
+		exit 1
+	fi
+	echo "$tag"
+}
+
+# tag_published TAG -- is TAG something we can have: already local, or (when
+# PULL_POLICY allows asking a registry at all) present on the registry?
+tag_published() {
+	local tag="$1"
+	if image_exists "$tag"; then
+		return 0
+	fi
+	[ "$PULL_POLICY" != never ] && docker manifest inspect "$tag" >/dev/null 2>&1
+}
+
+# image_threading IMAGE -> "nts" or "zts", by asking the PHP inside it
+# rather than trusting what its tag, or the version number, suggests.
+# Pulls first (per PULL_POLICY), except for our own php-bench/* builds.
+image_threading() {
+	local image="$1"
+	case "$image" in
+		php-bench/*) ;;
+		*) ensure_pulled "$image" ;;
+	esac
+	docker run --rm "$image" php -r 'echo PHP_ZTS ? "zts" : "nts";'
+}
+
+# resolve_cpu_pair VERSION OS -> "nts_id|nts_image|zts_id|zts_image": the two
+# sides of the nts-vs-zts comparison, worked out from what is actually
+# published instead of from a version number, since that has changed once
+# already (see the note in .targets.sh). `cli` is always one of the two sides
+# (it is what we ship), and the other is
+#   - cli is NTS (through 8.5): the `zts` tag;
+#   - cli is ZTS (8.6): the `nts` tag if docker-library has published one
+#     by now (https://github.com/docker-library/php/pull/1722 proposes one,
+#     but it is open and may not land), and otherwise an NTS rebuild of cli
+#     (ensure_nts).  If published as that PR describes it, the `nts` variant
+#     would skip --enable-embed, so unlike our rebuild it wouldn't be cli
+#     minus *only* the ZTS flags; the `zts` alias tags the same PR proposes
+#     for cli would be the very image cli already is, so they change nothing
+#     here.
+# Whichever way it comes out, each side is then checked by running it, so a
+# tag that doesn't mean what we assumed fails loudly instead of quietly
+# labeling a ZTS build "nts". The ids keep the tag's name for its slot
+# (cli/zts/nts), so result file names and summarize.jq don't care how a
+# side was arrived at.
+resolve_cpu_pair() {
+	local version="$1" os="$2"
+	local cli_image zts_tag nts_tag
+	cli_image="$(official_image "$version" cli "$os")"
+	zts_tag="$(official_image "$version" zts "$os")"
+	nts_tag="$(official_image "$version" nts "$os")"
+
+	local nts_id nts_image zts_id zts_image cli_threading
+	cli_threading="$(image_threading "$cli_image")"
+	case "$cli_threading" in
+		nts)
+			nts_id="$(official_id "$version" cli "$os")"
+			nts_image="$cli_image"
+			if ! tag_published "$zts_tag"; then
+				echo "error: no ZTS image for ${version}-${os}: ${cli_image} is NTS and ${zts_tag} isn't published" >&2
+				exit 1
+			fi
+			zts_id="$(official_id "$version" zts "$os")"
+			zts_image="$zts_tag"
+			;;
+		zts)
+			zts_id="$(official_id "$version" cli "$os")"
+			zts_image="$cli_image"
+			nts_id="$(official_id "$version" nts "$os")"
+			if tag_published "$nts_tag"; then
+				nts_image="$nts_tag"
+			else
+				nts_image="$(ensure_nts "$version" "$os")"
+			fi
+			;;
+		*)
+			echo "error: couldn't tell whether ${cli_image} is NTS or ZTS (got '${cli_threading}')" >&2
+			exit 1
+			;;
+	esac
+
+	local side image want got
+	for side in "nts|${nts_image}" "zts|${zts_image}"; do
+		want="${side%%|*}" image="${side#*|}"
+		got="$(image_threading "$image")"
+		if [ "$got" != "$want" ]; then
+			echo "error: ${image} is meant to be the ${want} side of ${version}-${os} but is ${got}" >&2
+			exit 1
+		fi
+	done
+
+	echo "${nts_id}|${nts_image}|${zts_id}|${zts_image}"
+}
+
+# prepare_cpu_pair VERSION OS -> "nts_id|nts_overlay|zts_id|zts_overlay": resolve_cpu_pair
+# plus the hyperfine overlay on both sides, ready to run.
+prepare_cpu_pair() {
+	local version="$1" os="$2"
+	local resolved nts_id nts_image zts_id zts_image
+	resolved="$(resolve_cpu_pair "$version" "$os")"
+	IFS='|' read -r nts_id nts_image zts_id zts_image <<<"$resolved"
+	local nts_overlay zts_overlay
+	nts_overlay="$(ensure_overlay "$nts_image" 0 0)"
+	zts_overlay="$(ensure_overlay "$zts_image" 0 0)"
+	echo "${nts_id}|${nts_overlay}|${zts_id}|${zts_overlay}"
+}
+
 # ensure_pulled TAG -- pulls if not already present locally
 ensure_pulled() {
 	local tag="$1"
@@ -212,6 +415,9 @@ cmd_list() {
 	echo "-- official targets --"
 	list_official_targets | awk -F'|' '{printf "%-40s %s\n", $1, $2}'
 	echo
+	echo "-- cpu nts/zts pairs (which image is which is resolved at run time) --"
+	list_cpu_pairs | awk -F'|' '{printf "%-8s %s\n", $1, $2}'
+	echo
 	echo "-- distro-pkg targets --"
 	list_distro_pkg_targets | awk -F'|' '{printf "%-40s %s (from %s)\n", $1, $5, $2}'
 	echo
@@ -230,9 +436,10 @@ cmd_build_distro_pkg() {
 }
 
 # bench_script_suite SUITE NEED_CURL NEED_IMAGICK TARGET_FN [--only PATTERN]
-# Shared driver for cpu/tls/imagick: all three run one script (or a fixed
-# script list) via bench/<suite>/run.sh against every target TARGET_FN
-# lists (a .targets.sh list_*_targets function) plus every distro-pkg target.
+# Shared driver for tls/imagick: both run one script (or a fixed script
+# list) via bench/<suite>/run.sh against every target TARGET_FN lists (a
+# .targets.sh list_*_targets function) plus every distro-pkg target. (cpu
+# has its own driver, bench_cpu_suite, for its interleaved nts/zts pairs.)
 bench_script_suite() {
 	local suite="$1" need_curl="$2" need_imagick="$3" target_fn="$4"
 	shift 4
@@ -248,7 +455,20 @@ bench_script_suite() {
 		run_in_target "$suite" "$id" "$overlay" php
 	done
 
-	local base_image built_image
+	bench_distro_pkg_targets "$suite" "$@"
+}
+
+# bench_distro_pkg_targets SUITE [--only PATTERN] -- runs bench/<suite>/run.sh
+# against every distro-pkg target.
+bench_distro_pkg_targets() {
+	local suite="$1"
+	shift
+	local only=""
+	if [ "${1:-}" = "--only" ]; then
+		only="$2"
+	fi
+
+	local id base_image built_image os label overlay
 	list_distro_pkg_targets | while IFS='|' read -r id base_image built_image os label; do
 		[ -n "$only" ] && [[ "$id" != *"$only"* ]] && continue
 		built_image="$(ensure_distro_pkg "$os")"
@@ -257,6 +477,158 @@ bench_script_suite() {
 		overlay="$(ensure_overlay "$built_image" 0 0)"
 		run_in_target "$suite" "$id" "$overlay" php
 	done
+}
+
+# is_slow_cpu_script NAME -- see CPU_SLOW_SCRIPTS in .targets.sh
+is_slow_cpu_script() {
+	local s
+	for s in "${CPU_SLOW_SCRIPTS[@]}"; do
+		[ "$s" = "$1" ] && return 0
+	done
+	return 1
+}
+
+# run_cpu_workload TARGET_ID IMAGE WORKLOAD OUT_DIR RUNS WARMUP -- one
+# hyperfine workload (script:variant) in one fresh container, its
+# hyperfine JSON landing in OUT_DIR/cpu-TARGET_ID.json.
+run_cpu_workload() {
+	local target_id="$1" image="$2" workload="$3" out_dir="$4" runs="$5" warmup="$6"
+	mkdir -p "$out_dir"
+	docker run --rm \
+		-v "${PROJECT_DIR}/bench/cpu:/bench:ro" \
+		-v "${out_dir}:/results" \
+		-v "${PROJECT_DIR}/bench/summarize-hyperfine.php:/summarize-hyperfine.php:ro" \
+		-v "${PROJECT_DIR}/bench/merge-hyperfine.php:/merge-hyperfine.php:ro" \
+		-e "TARGET_ID=${target_id}" \
+		-e "RESULTS_DIR=/results" \
+		-e "PHP_BIN=php" \
+		-e "ONLY_WORKLOAD=${workload}" \
+		-e "RUNS=${runs}" \
+		-e "WARMUP=${warmup}" \
+		-w /bench \
+		"$image" \
+		sh run.sh
+}
+
+# combine_cpu_rounds -- jq filter (for `jq --slurp`): hyperfine exports of
+# one workload from several rounds -> one hyperfine-shaped result whose
+# `times` pool every round (so mean/stddev, and the standard error
+# summarize.jq derives from them, include the drift *between* rounds, not
+# just the scatter inside one), plus `rounds`: each round's own mean, kept
+# so summarize.jq can pair the two sides round by round.
+CPU_COMBINE_ROUNDS='
+	map(.results[0]) as $rs
+	| ($rs | map(.times) | add) as $times
+	| ($times | length) as $n
+	| ($times | add / $n) as $mean
+	| {
+		command: $rs[0].command,
+		mean: $mean,
+		stddev: (if $n > 1 then ($times | map(. - $mean | . * .) | add / ($n - 1) | sqrt) else 0 end),
+		median: ($times | sort | .[($n / 2 | floor)]),
+		min: ($times | min),
+		max: ($times | max),
+		times: $times,
+		rounds: ($rs | map({ mean, stddev, runs: (.times | length) })),
+	}
+'
+
+# bench_cpu_pair VERSION OS -- runs the cpu suite on both sides of one
+# nts-vs-zts pair (resolve_cpu_pair works out which images those are)
+# *interleaved*: for each of
+# CPU_ROUNDS rounds, for each workload, the two sides run back to back (in
+# alternating order each round, so a steady drift doesn't favor whichever
+# side always goes first). Running one whole target and then the other
+# puts minutes between the two numbers being compared, which on a shared
+# runner is long enough for the machine itself to change speed: hyperfine's
+# stddev only sees scatter *within* a run, so that drift looked like a real
+# nts/zts difference (including zts being "measurably faster", which it
+# can't plausibly be; see https://github.com/docker-library/php/issues/1719).
+# Interleaving keeps each pair of numbers seconds apart, and summarize.jq
+# judges the gap on the round-by-round paired ratio.
+#
+# Each round times CPU_ROUND_RUNS runs per workload after CPU_ROUND_WARMUP
+# warmups (CPU_SLOW_* for CPU_SLOW_SCRIPTS, which take seconds per run).
+bench_cpu_pair() {
+	local version="$1" os="$2"
+	local rounds="${CPU_ROUNDS:-5}"
+	local fast_runs="${CPU_ROUND_RUNS:-10}" fast_warmup="${CPU_ROUND_WARMUP:-1}"
+	local slow_runs="${CPU_SLOW_ROUND_RUNS:-3}" slow_warmup="${CPU_SLOW_ROUND_WARMUP:-0}"
+
+	local prepared nts_id nts_overlay zts_id zts_overlay
+	prepared="$(prepare_cpu_pair "$version" "$os")"
+	IFS='|' read -r nts_id nts_overlay zts_id zts_overlay <<<"$prepared"
+
+	local workloads=() script variant
+	for script in "${PROJECT_DIR}"/bench/cpu/scripts/*.php; do
+		for variant in "${CPU_VARIANTS[@]}"; do
+			workloads+=("$(basename "$script" .php):${variant}")
+		done
+	done
+
+	local tmp; tmp="$(mktemp --directory)"
+	local round workload side id overlay runs warmup order dir
+	for round in $(seq 1 "$rounds"); do
+		echo "=== cpu: ${nts_id} vs ${zts_id}, round ${round}/${rounds} ===" >&2
+		order=(nts zts)
+		if [ $((round % 2)) -eq 0 ]; then
+			order=(zts nts)
+		fi
+		for workload in "${workloads[@]}"; do
+			if is_slow_cpu_script "${workload%%:*}"; then
+				runs="$slow_runs" warmup="$slow_warmup"
+			else
+				runs="$fast_runs" warmup="$fast_warmup"
+			fi
+			for side in "${order[@]}"; do
+				if [ "$side" = nts ]; then
+					id="$nts_id" overlay="$nts_overlay"
+				else
+					id="$zts_id" overlay="$zts_overlay"
+				fi
+				dir="${tmp}/${side}/${workload//:/_}/$(printf 'r%03d' "$round")"
+				run_cpu_workload "$id" "$overlay" "$workload" "$dir" "$runs" "$warmup"
+			done
+		done
+	done
+
+	local out_dir="${RESULTS_DIR}/cpu"
+	mkdir -p "$out_dir"
+	for side in nts zts; do
+		if [ "$side" = nts ]; then id="$nts_id"; else id="$zts_id"; fi
+		for workload in "${workloads[@]}"; do
+			jq --slurp "$CPU_COMBINE_ROUNDS" "${tmp}/${side}/${workload//:/_}"/r*/"cpu-${id}.json"
+		done | jq --slurp --arg threading "$side" '{ threading: $threading, results: . }' > "${out_dir}/cpu-${id}.json"
+		echo "--- ${id} (${rounds} rounds) ---" >&2
+		jq --raw-output '
+			.results[]
+			| "  \(.command)  \(.mean * 1000 | . * 10 | round / 10) ms +/- \(.stddev * 1000 | . * 10 | round / 10) ms  (\(.times | length) runs)"
+		' "${out_dir}/cpu-${id}.json" >&2
+	done
+	rm --recursive --force "$tmp"
+}
+
+# bench_cpu_suite [--only PATTERN] -- every nts/zts pair interleaved, then
+# every distro-pkg target the ordinary way.
+bench_cpu_suite() {
+	local only=""
+	if [ "${1:-}" = "--only" ]; then
+		only="$2"
+	fi
+
+	# Which tags make up a pair isn't known until it is resolved, and
+	# resolving pulls images -- so --only is matched against every id a
+	# pair's sides could end up with, before doing any of that.
+	local version os names
+	list_cpu_pairs | while IFS='|' read -r version os; do
+		names="${version} ${os} $(official_id "$version" cli "$os") $(official_id "$version" zts "$os") $(official_id "$version" nts "$os")"
+		if [ -n "$only" ] && [[ "$names" != *"$only"* ]]; then
+			continue
+		fi
+		bench_cpu_pair "$version" "$os"
+	done
+
+	bench_distro_pkg_targets cpu "$@"
 }
 
 THROUGHPUT_NETWORK="php-bench-throughput"
@@ -390,11 +762,13 @@ cmd_ensure_images() {
 	done
 
 	local id image version target_os sapi label
-	list_cpu_bench_targets | while IFS='|' read -r id image version target_os sapi label; do
-		ensure_overlay "$image" 0 0 >/dev/null
+	list_cpu_pairs | while IFS='|' read -r version target_os; do
+		prepare_cpu_pair "$version" "$target_os" >/dev/null
 	done
 	list_cpu_style_official_targets | while IFS='|' read -r id image version target_os sapi label; do
 		ensure_overlay "$image" 1 0 >/dev/null
+	done
+	list_imagick_targets | while IFS='|' read -r id image version target_os sapi label; do
 		ensure_overlay "$image" 0 1 >/dev/null
 	done
 
@@ -409,13 +783,13 @@ cmd_bench() {
 	local suite="$1"
 	shift
 	case "$suite" in
-		cpu) bench_script_suite cpu 0 0 list_cpu_bench_targets "$@" ;;
+		cpu) bench_cpu_suite "$@" ;;
 		tls) bench_script_suite tls 1 0 list_cpu_style_official_targets "$@" ;;
 		imagick)
 			if [ ! -f "${PROJECT_DIR}/bench/imagick/assets/bench.jpg" ]; then
 				bash "${PROJECT_DIR}/bench/imagick/generate-asset.sh"
 			fi
-			bench_script_suite imagick 0 1 list_cpu_style_official_targets "$@"
+			bench_script_suite imagick 0 1 list_imagick_targets "$@"
 			;;
 		throughput) bench_throughput_suite "$@" ;;
 		*)

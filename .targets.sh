@@ -12,11 +12,32 @@
 #     reports pair it against whichever official version(s) match.
 set -Eeuo pipefail
 
-PHP_VERSIONS=(8.2 8.3 8.4 8.5)
+PHP_VERSIONS=(8.2 8.3 8.4 8.5 8.6)
 DEBIAN_OSES=(bookworm trixie)
 ALPINE_OSES=(alpine3.23 alpine3.24)
 OSES=("${DEBIAN_OSES[@]}" "${ALPINE_OSES[@]}")
-SAPIS=(cli fpm zts)
+
+# version_ge A B -- true if dotted version A >= B.
+version_ge() {
+	[ "$(printf '%s\n' "$1" "$2" | sort --version-sort | head --lines=1)" = "$2" ]
+}
+
+# Which published image is the NTS build and which the ZTS build is *not*
+# written down here, on purpose: it has changed once already (8.6 made every
+# tag ZTS and dropped the `zts` variant, see
+# https://github.com/docker-library/php/issues/1719) and may again (an
+# explicit `nts` tag, or `cli` going back to NTS with `zts` restored).
+# https://github.com/docker-library/php/pull/1722 (open as of 2026-11-20, and
+# not certain to be merged) proposes one such change: an 8.6-only `nts`
+# variant, plus `zts` alias tags for `cli`.  The cpu suite works it out at
+# run time instead -- resolve_cpu_pair in run.sh.
+
+# 8.6+ images drop pecl/pear (no --with-pear), which install-imagick.sh
+# needs; the imagick suite skips those versions.
+NO_PECL_FROM=8.6
+version_has_pecl() {
+	! version_ge "$1" "$NO_PECL_FROM"
+}
 
 is_debian_os() {
 	local os="$1" d
@@ -36,13 +57,20 @@ official_id() {
 	echo "official-${version}-${sapi}-${os}"
 }
 
+nts_built_image() {
+	local version="$1" os="$2"
+	echo "php-bench/nts:${version}-cli-${os}"
+}
+
 # Emits "id|image|version|os|sapi|label", one per line, for every official
-# tag in the matrix (cli/fpm/zts everywhere, +apache on Debian OSes).
+# tag in the matrix that doesn't depend on which build is which (cli/fpm
+# everywhere, +apache on Debian OSes). The cpu suite's nts/zts tags aren't
+# here; see list_cpu_pairs.
 list_official_targets() {
 	local version os sapi
 	for version in "${PHP_VERSIONS[@]}"; do
 		for os in "${OSES[@]}"; do
-			local sapis=("${SAPIS[@]}")
+			local sapis=(cli fpm)
 			is_debian_os "$os" && sapis+=(apache)
 			for sapi in "${sapis[@]}"; do
 				local image; image="$(official_image "$version" "$sapi" "$os")"
@@ -55,19 +83,46 @@ list_official_targets() {
 
 # Same, but CLI-only -- the relevant subset for TLS/Imagick benchmarks
 # (fpm/apache don't change the speed of `php script.php`; the CPU suite
-# uses list_cpu_bench_targets below instead, since zts *does* change it and
-# is exactly what that suite is for).
+# uses list_cpu_pairs below instead, since zts *does* change it and is
+# exactly what that suite is for).
 list_cpu_style_official_targets() {
 	list_official_targets | awk -F'|' '$5 == "cli"'
 }
 
-# CLI + zts -- TSRM (thread-safety bookkeeping) adds real per-access
+# Same, but without the versions whose images have no pecl -- the imagick
+# suite compiles its extension from pecl (images/overlay/install-imagick.sh).
+list_imagick_targets() {
+	local id image version os sapi label
+	list_cpu_style_official_targets | while IFS='|' read -r id image version os sapi label; do
+		if version_has_pecl "$version"; then
+			echo "${id}|${image}|${version}|${os}|${sapi}|${label}"
+		fi
+	done
+}
+
+# The cpu suite's script variants (bench/cpu/run.sh defines what each means).
+CPU_VARIANTS=(baseline opcache jit)
+
+# Scripts that take seconds per run (hash is deliberately a bcrypt loop), and
+# so get far fewer timed runs per interleaved round than the millisecond
+# ones -- see bench_cpu_pair in run.sh.
+CPU_SLOW_SCRIPTS=(hash)
+
+# Emits "version|os", one per version/OS: the pairs the nts-vs-zts
+# comparison runs on. TSRM (thread-safety bookkeeping) adds real per-access
 # overhead to every global/static lookup even with a single thread running,
 # which is the "non-negligible" cost flagged in
-# https://github.com/docker-library/php/issues/742. Comparing it needs
-# nothing new: php:$version-zts-$os already exists as an official tag.
-list_cpu_bench_targets() {
-	list_official_targets | awk -F'|' '$5 == "cli" || $5 == "zts"'
+# https://github.com/docker-library/php/issues/742. Which images make up
+# each side is resolved at run time (resolve_cpu_pair in run.sh), and the two
+# sides are run interleaved (bench_cpu_pair) rather than one target after
+# the other.
+list_cpu_pairs() {
+	local version os
+	for version in "${PHP_VERSIONS[@]}"; do
+		for os in "${OSES[@]}"; do
+			echo "${version}|${os}"
+		done
+	done
 }
 
 distro_pkg_base_image() {
@@ -107,10 +162,13 @@ list_distro_pkg_targets() {
 # apache image is an NTS build, and Apache refuses to load a non-thread-safe
 # PHP module under a threaded MPM (mpm_event/mpm_worker) -- confirmed by
 # actually trying it (`a2enmod mpm_event` -> "Apache is running a threaded
-# MPM, but your PHP Module is not compiled to be threadsafe"), and there is
-# no official image today that combines ZTS with Apache to work around it.
-# That's a real, reproducible answer to #742, just not one hyperfine/a load
-# test can put a number on.
+# MPM, but your PHP Module is not compiled to be threadsafe"), and no
+# official apache image through 8.5 is ZTS. That's a real, reproducible
+# answer to #742, just not one hyperfine/a load test can put a number on.
+# 8.6's apache image *is* ZTS (all of 8.6's are, per the note near the top
+# of this file), though it still ships with `a2dismod mpm_event && a2enmod
+# mpm_prefork`, so the 8.6 apache targets below are still prefork; whether
+# mpm_event now loads there is untested.
 list_throughput_targets() {
 	local version os mode
 	for version in "${PHP_VERSIONS[@]}"; do

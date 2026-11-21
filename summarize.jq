@@ -25,11 +25,22 @@ def target_id_of($path; $suite):
 	| .[-1] | sub("\\.json$"; "") | sub("^" + $suite + "-"; "")
 ;
 
-# "official-8.2-cli-bookworm" -> {kind,version,sapi,os}; "distro-pkg-bookworm" -> distro-pkg has no version/sapi
+# Fallback guess at whether an official tag is thread-safe, for result files
+# that don't record it: the `zts` and `nts` slots say so themselves, and of
+# the rest, 8.6+ `cli` images were all ZTS and earlier ones all NTS (which
+# is how things stood when this was written; current result files carry the
+# answer run.sh worked out, and this isn't consulted for them).
+def threading_of($version; $sapi):
+	if $sapi == "zts" or $sapi == "nts" then $sapi
+	elif ($version | split(".") | map(tonumber)) >= [8, 6] then "zts"
+	else "nts" end
+;
+
+# "official-8.2-cli-bookworm" -> {kind,version,sapi,threading,os}; "distro-pkg-bookworm" -> distro-pkg has no version/sapi/threading
 def parse_official_id($id):
 	($id | split("-")) as $p
 	| if $p[0] == "official" then
-		{ kind: "official", version: $p[1], sapi: $p[2], os: $p[3] }
+		{ kind: "official", version: $p[1], sapi: $p[2], threading: threading_of($p[1]; $p[2]), os: $p[3] }
 	else
 		{ kind: "distro-pkg", version: null, sapi: null, os: $p[2] }
 	end
@@ -194,7 +205,11 @@ def all_raw:
 	| suite_of($path) as $suite
 	| target_id_of($path; $suite) as $tid
 	| if $suite == "cpu" then
-		parse_official_id($tid) as $t
+		# `threading` is recorded by run.sh's bench_cpu_pair, which worked it
+		# out by running the image; the id-based guess in threading_of is
+		# only for result files from before that, and for distro-pkg (which
+		# has none)
+		(parse_official_id($tid) | if $doc.threading != null then .threading = $doc.threading else . end) as $t
 		| $doc.results[]
 		| $t + {
 			$suite,
@@ -202,6 +217,9 @@ def all_raw:
 			variant: (.command | split(":")[1]),
 			mean_ms: (.mean * 1000),
 			se_ms: se_of(.stddev * 1000; (.times | length)),
+			# only the interleaved nts/zts targets have these (run.sh's
+			# bench_cpu_pair): each round's own mean, in order
+			rounds: [ (.rounds // [])[] | .mean * 1000 ],
 		}
 	elif $suite == "tls" then
 		parse_official_id($tid) as $t
@@ -289,10 +307,10 @@ def glossary:
 	(
 		[
 			"- **official** is the `docker-library/php` image's own compiled PHP; **distro-pkg** is the same distro's packaged PHP (`php-cli` and friends).",
-			"- **cli** and **zts** are the non-threaded and thread-safe PHP builds. **baseline**, **opcache** and **jit** are the same build run with no bytecode cache, with opcache, and with opcache plus the JIT compiler.",
+			"- **nts** and **zts** are the non-threaded and thread-safe PHP builds. Each side is whichever official image really is that build (run.sh checks by running it, rather than trusting tag names): through 8.5 that is `cli` (nts) and `zts`; in 8.6 every tag is zts, so nts is the official `nts` tag if docker-library has published one and otherwise the 8.6 `cli` Dockerfile rebuilt here without `--enable-zts` (and without `--disable-zend-signals`, which goes with it). Everywhere else, **official** `cli` means the image as shipped, so for 8.6 that is zts. **baseline**, **opcache** and **jit** are the same build run with no bytecode cache, with opcache, and with opcache plus the JIT compiler.",
 			"- **p50/p95/p99 ms** mean half, 95% and 99% of requests finished at least that fast; p99 is roughly the worst case a real user hits.",
 			"- **\"too close to call\"** means the gap between the two numbers is not big enough to believe: it is smaller than either the run-to-run scatter hyperfine measured, or the disagreement between the PHP versions being averaged, whichever is larger. The millisecond figures are still shown, but the difference between them is not something to act on. Anything under 1% is reported this way too, on the grounds that nobody should care.",
-			"- Millisecond columns average across whichever PHP versions were benchmarked (8.2-8.5 in a full run) and, where relevant, the OSes. Where the versions disagree enough for that average to mislead on its own, it is also called out under the table.",
+			"- Millisecond columns average across whichever PHP versions were benchmarked (8.2-8.6 in a full run) and, where relevant, the OSes. Where the versions disagree enough for that average to mislead on its own, it is also called out under the table.",
 			empty
 		]
 		| join("\n")
@@ -410,28 +428,123 @@ def report_cpu_official_vs_distro($rows):
 	end
 ;
 
-def rows_cpu_cli_vs_zts($recs):
-	[ $recs[] | select(.sapi == "cli" or .sapi == "zts") ]
+# The nts and zts sides of an interleaved pair were run alternately, round
+# by round, seconds apart (run.sh's bench_cpu_pair), so the ratio within a
+# round is immune to the machine speeding up or slowing down between rounds
+# -- the drift that comparing two separately-run means mistakes for a real
+# difference. One cell per version/OS with rounds on both sides:
+# {delta_pct, se_pct} is the average per-round zts-over-nts gap and its
+# standard error across rounds.
+def paired_cells:
+	group_by([ .version, .os ])
+	| map(
+		(map(select(.threading == "nts")) | .[0]) as $n
+		| (map(select(.threading == "zts")) | .[0]) as $z
+		| ($n.rounds // [] | length) as $r
+		| if $r >= 2 and $r == ($z.rounds // [] | length) then
+			[ range(0; $r) as $i | ($z.rounds[$i] / $n.rounds[$i] - 1) * 100 ] as $d
+			| {
+				version: $n.version,
+				os: $n.os,
+				rounds: $r,
+				delta_pct: ($d | add / length),
+				se_pct: (($d | stddev_of) / ($d | length | sqrt)),
+			}
+		else empty end
+	)
+;
+
+# How many version/OS pairs have both an nts and a zts record at all
+def pair_count:
+	group_by([ .version, .os ])
+	| map(select(any(.threading == "nts") and any(.threading == "zts")))
+	| length
+;
+
+# Pool cells the way `agg` pools means: the averaged gap is only as certain
+# as the larger of (the cells' own standard errors, shrunk by the number
+# of cells) and (the cells disagreeing with one another).
+def agg_paired($cells):
+	($cells | length) as $k
+	| ($cells | map(.delta_pct)) as $d
+	| ($cells | map(.rounds) | min) as $r
+	| ((($cells | map(.se_pct * .se_pct) | add | sqrt) / $k)) as $within
+	| (if $k > 1 then (($d | stddev_of) / ($k | sqrt)) else 0 end) as $between
+	| {
+		delta_pct: ($d | add / $k),
+		se_pct: ([ $within, $between ] | max),
+		rounds: $r,
+		# degrees of freedom behind whichever of the two dominates: the
+		# cells' own round-to-round scatter, or the cells disagreeing
+		df: (if $within >= $between then $k * ($r - 1) else $k - 1 end),
+	}
+;
+
+# Two-sided 95% critical value of Student's t. With only a handful of
+# rounds the standard error is itself a rough estimate, and 1.96 (the
+# normal value, fine for the hundreds of samples hyperfine's own se rests
+# on) would call noise a difference far too often: 3 rounds is 2 degrees
+# of freedom, where the real cutoff is 4.30 standard errors.
+def t_crit($df):
+	if $df <= 1 then 12.706
+	elif $df <= 2 then 4.303
+	elif $df <= 3 then 3.182
+	elif $df <= 4 then 2.776
+	elif $df <= 5 then 2.571
+	elif $df <= 6 then 2.447
+	elif $df <= 8 then 2.306
+	elif $df <= 10 then 2.228
+	elif $df <= 15 then 2.131
+	elif $df <= 20 then 2.086
+	elif $df <= 30 then 2.042
+	else 1.96 end
+;
+
+# verdict_lower's counterpart for a paired gap: delta_pct > 0 means $b is
+# slower. Same bar, with t instead of 1.96 (see t_crit) -- beyond that many
+# standard errors, and at least negligible_pct of the slower one -- and the
+# same wording.
+def verdict_paired($p; $a_label; $b_label):
+	$p.delta_pct as $d
+	| (if $d > 0 then $d / (100 + $d) * 100 else ($d | fabs) end) as $faster
+	| if ($d | fabs) > t_crit($p.df) * $p.se_pct and $faster >= negligible_pct then
+		(if $d > 0 then $a_label else $b_label end) + " \($faster | fixed(0))% faster"
+	else
+		"too close to call"
+	end
+;
+
+def rows_cpu_nts_vs_zts($recs):
+	# By threading, not by sapi: before 8.6 the NTS side is the `cli` tag
+	# and the ZTS side the `zts` tag; from 8.6 the `cli` tag is the ZTS
+	# side, and the NTS side is our own `nts` rebuild of it.
+	[ $recs[] | select(.kind == "official" and (.sapi | IN("cli", "zts", "nts"))) ]
 	| group_by([ .script, .variant ])
 	| map(
 		. as $g
 		| {
 			script: .[0].script,
 			variant: .[0].variant,
-			cli: (map(select(.sapi == "cli")) | agg),
-			zts: (map(select(.sapi == "zts")) | agg),
+			nts: (map(select(.threading == "nts")) | agg),
+			zts: (map(select(.threading == "zts")) | agg),
+			paired: (
+				paired_cells as $cells
+				| if ($cells | length) > 0 and ($cells | length) == pair_count then
+					agg_paired($cells)
+				else null end
+			),
 			by_version: (
 				$g
 				| group_by(.version)
 				| map(
-					(map(select(.sapi == "cli")) | agg) as $c
-					| (map(select(.sapi == "zts")) | agg) as $z
-					| if ($c.ms == null or $z.ms == null) then
+					(map(select(.threading == "nts")) | agg) as $n
+					| (map(select(.threading == "zts")) | agg) as $z
+					| if ($n.ms == null or $z.ms == null) then
 						empty
 					else
 						{
 							version: .[0].version,
-							delta_pct: (($z.ms - $c.ms) / $c.ms * 100),
+							delta_pct: (($z.ms - $n.ms) / $n.ms * 100),
 						}
 					end
 				)
@@ -439,18 +552,27 @@ def rows_cpu_cli_vs_zts($recs):
 			),
 		}
 	)
-	| complete_or_null([ "cli", "zts" ])
+	| complete_or_null([ "nts", "zts" ])
 	| if . == null then null else
-		map(. + {
-			delta_pct: ((.zts.ms - .cli.ms) / .cli.ms * 100),
-			verdict: verdict_lower(.cli; .zts; "cli"; "zts"),
-		})
+		map(
+			if .paired != null then
+				. + {
+					delta_pct: .paired.delta_pct,
+					verdict: verdict_paired(.paired; "nts"; "zts"),
+				}
+			else
+				. + {
+					delta_pct: ((.zts.ms - .nts.ms) / .nts.ms * 100),
+					verdict: verdict_lower(.nts; .zts; "nts"; "zts"),
+				}
+			end
+		)
 		| sort_by(.script, .variant)
 	end
 ;
 
-def answer_cpu_cli_vs_zts($rows):
-	([ $rows[] | select(.verdict | startswith("cli")) ]) as $zts_slower
+def answer_cpu_nts_vs_zts($rows):
+	([ $rows[] | select(.verdict | startswith("nts")) ]) as $zts_slower
 	| ([ $rows[] | select(.verdict | startswith("zts")) ]) as $zts_faster
 	| ([ $rows[] | select(.verdict == "too close to call") ]) as $tie
 	| if ($zts_slower | length) == 0 then
@@ -482,12 +604,12 @@ def answer_cpu_cli_vs_zts($rows):
 	end
 ;
 
-def report_cpu_cli_vs_zts($rows):
+def report_cpu_nts_vs_zts($rows):
 	heading("CPU: what does the thread-safe (zts) build cost? -- https://github.com/docker-library/php/issues/742"),
 	table([
 		"script",
 		"variant",
-		"cli_ms",
+		"nts_ms",
 		"zts_ms",
 		"who wins",
 		empty
@@ -496,13 +618,28 @@ def report_cpu_cli_vs_zts($rows):
 		| [
 			.script,
 			.variant,
-			(.cli.ms | fixed(0)),
+			(.nts.ms | fixed(0)),
 			(.zts.ms | fixed(0)),
 			.verdict,
 			empty
 		]
 	]),
-	"> " + answer_cpu_cli_vs_zts($rows),
+	"> " + answer_cpu_nts_vs_zts($rows),
+	(
+		[ $rows[] | select(.paired != null) ] as $paired
+		| if ($paired | length) > 0 then
+			"> nts and zts were run alternately, round by round (at least \($paired | map(.paired.rounds) | min) rounds), so each of those verdicts judges the paired per-round ratio instead of two means taken minutes apart: drift in the runner's own speed between rounds can't pass for a difference."
+		else empty end
+	),
+	(
+		# 8.6 changed more than threading: it dropped --with-pic, which
+		# changes how thread-local storage gets accessed, so the trend in
+		# the zts cost from 8.5 to 8.6 is not php-src alone.
+		($rows | map(.by_version[].version) | unique) as $versions
+		| if ($versions | index("8.6")) != null and ($versions | length) > 1 then
+			"> note: 8.6 also dropped `--with-pic` ([docker-library/php#1692](https://github.com/docker-library/php/pull/1692)), which changes how thread-local storage is accessed, so the change in the zts cost between 8.5 and 8.6 mixes php-src's own work with that build flag; the 8.6 nts/zts pair itself differs only in threading."
+		else empty end
+	),
 	(
 		[
 			$rows[]
@@ -998,7 +1135,7 @@ def bottom_line($items):
 | ($all | map(select(.suite == "imagick"))) as $imagick
 | ($all | map(select(.suite == "throughput"))) as $throughput
 | rows(rows_cpu_official_vs_distro(.); $cpu) as $r_vs_distro
-| rows(rows_cpu_cli_vs_zts(.); $cpu) as $r_zts
+| rows(rows_cpu_nts_vs_zts(.); $cpu) as $r_zts
 | rows(rows_cpu_opcache_jit(.); $cpu) as $r_jit
 | rows(rows_tls(.); $tls) as $r_tls
 | rows(rows_imagick(.); $imagick) as $r_imagick
@@ -1012,7 +1149,7 @@ def bottom_line($items):
 		},
 		{
 			q: "What does the thread-safe (zts) build cost?",
-			a: report(answer_cpu_cli_vs_zts(.); $r_zts),
+			a: report(answer_cpu_nts_vs_zts(.); $r_zts),
 		},
 		{
 			q: "Do opcache and JIT actually help?",
@@ -1034,7 +1171,7 @@ def bottom_line($items):
 	]),
 	glossary,
 	report(report_cpu_official_vs_distro(.); $r_vs_distro),
-	report(report_cpu_cli_vs_zts(.); $r_zts),
+	report(report_cpu_nts_vs_zts(.); $r_zts),
 	report(report_cpu_opcache_jit(.); $r_jit),
 	report(report_tls(.); $r_tls),
 	report(report_imagick(.); $r_imagick),
