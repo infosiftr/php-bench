@@ -10,6 +10,12 @@
 # right before each one starts -- otherwise there is no visible progress
 # at all for the several minutes a target takes (dominated by the
 # deliberately-slow hash script), only a burst of results at the very end.
+#
+# ONLY_WORKLOAD=script:variant runs just that one (RUNS=N / WARMUP=N then
+# replace hyperfine's default count-and-3-seconds rule with exactly N timed
+# runs): that is how run.sh's bench_cpu_pair interleaves the two sides of
+# the nts-vs-zts comparison, one workload at a time, round after round. The
+# variant names below must stay in sync with CPU_VARIANTS in .targets.sh.
 set -eu
 cd "$(dirname "$0")"
 
@@ -18,6 +24,14 @@ OUT_DIR="${RESULTS_DIR:-/results}"
 mkdir -p "$OUT_DIR"
 
 PHP_BIN="${PHP_BIN:-php}"
+
+ONLY_WORKLOAD="${ONLY_WORKLOAD:-}"
+WARMUP="${WARMUP:-3}"
+if [ -n "${RUNS:-}" ]; then
+	run_args="--runs ${RUNS}"
+else
+	run_args="--min-runs 15"
+fi
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -36,13 +50,27 @@ for script in scripts/*.php; do
 		label="${name}:${variant}"
 		part="${TMP_DIR}/${name}_${variant}.json"
 
-		echo "Running: ${label}" >&2
-		hyperfine --warmup 3 --min-runs 15 --export-json "$part" --command-name "$label" "$cmd" >/dev/null
-		php /summarize-hyperfine.php "$part"
+		if [ -n "$ONLY_WORKLOAD" ] && [ "$label" != "$ONLY_WORKLOAD" ]; then
+			continue
+		fi
+
+		if [ -z "$ONLY_WORKLOAD" ]; then
+			echo "Running: ${label}" >&2
+		fi
+		# run_args is deliberately unquoted: two words we built ourselves above.
+		hyperfine --warmup "$WARMUP" $run_args --export-json "$part" --command-name "$label" "$cmd" >/dev/null
+		if [ -z "$ONLY_WORKLOAD" ]; then
+			php /summarize-hyperfine.php "$part"
+		fi
 
 		part_files="$part_files $part"
 	done
 done
+
+if [ -z "$part_files" ]; then
+	echo "error: ONLY_WORKLOAD='${ONLY_WORKLOAD}' matched nothing" >&2
+	exit 1
+fi
 
 # part_files is deliberately unquoted: a space-separated list of temp file
 # paths we built ourselves above, safe to word-split.

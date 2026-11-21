@@ -40,8 +40,9 @@ jobs:
         run: ./run.sh ensure-images --pull --build
 
       # fastest to slowest, now that ensure-images has moved pull/build cost
-      # out of each of these -- cpu is last by a wide margin (36 targets, and
-      # its deliberately-slow bcrypt hash script run 3 ways on every one)
+      # out of each of these -- cpu is last by a wide margin (every nts/zts
+      # pair is run interleaved over several rounds, and its deliberately-slow
+      # bcrypt hash script runs 3 ways on every target)
       - name: tls
         run: ./run.sh bench tls
 
